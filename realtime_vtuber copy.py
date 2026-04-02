@@ -16,10 +16,7 @@ from openai import OpenAI
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # ================= CONFIG =================
-VTS_WS = "ws://127.0.0.1:8001"
-
-# 👉 CHANGE THIS if needed
-MODEL_PATH = "model"  # e.g. "checkpoints/higgs.pt"
+VTS_WS = "ws://localhost:8001"
 
 # ================= GLOBAL STATE =================
 state_lock = threading.Lock()
@@ -55,24 +52,20 @@ def ask_llm(text):
     print("🤖 AI:", reply)
     return reply
 
-# ================= HIGGS (FIXED) =================
+# ================= HIGGS =================
 def higgs_tts(text):
     out = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
 
-    print("🔊 Generating TTS (Higgs real)...")
-
     try:
         subprocess.run([
-            "python",
-            "examples/generation.py",
-            "--transcript", text,
-            "--out_path", out
-        ], check=True)
-    except Exception as e:
-        print("❌ Higgs failed:", e)
+            "python", "higgs_audio/infer.py",
+            "--text", text,
+            "--output", out
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    except:
+        print("⚠️ Higgs failed")
         return None
 
-    print(f"📁 TTS file: {out}")
     return out
 
 def split_sentences(text):
@@ -113,7 +106,7 @@ def connect_vts():
         res = json.loads(ws.recv())
 
         if "data" not in res:
-            print("⚠️ No token received")
+            print("⚠️ No token received (check VTS popup)")
             return None
 
         token = res["data"]["authenticationToken"]
@@ -138,7 +131,7 @@ def connect_vts():
             print("✅ Connected to VTube Studio")
             return ws
 
-        print("⚠️ Authentication failed")
+        print("⚠️ Authentication failed (did you click Allow?)")
         return None
 
     except Exception as e:
@@ -193,7 +186,6 @@ def play_audio(path):
     global is_speaking, stop_speaking
 
     if not path:
-        print("❌ No audio file")
         return
 
     import sounddevice as sd
@@ -202,8 +194,6 @@ def play_audio(path):
 
     if len(data.shape) > 1:
         data = data[:, 0]
-
-    print("🔊 Playing audio...")
 
     with state_lock:
         is_speaking = True
@@ -231,28 +221,21 @@ def play_audio(path):
 
 # ================= SPEECH =================
 def speak_stream(text):
-    print("🧠 Speaking:", text)
-
     sentences = split_sentences(text)
 
     for s in sentences:
+        with state_lock:
+            if stop_speaking:
+                break
+
         if not s.strip():
             continue
 
-        print("➡️ TTS sentence:", s)
-
         audio = higgs_tts(s)
-
-        if not audio:
-            print("❌ No audio generated")
-            continue
-
         play_audio(audio)
 
 def speak_async(text):
     global current_speech_thread, stop_speaking
-
-    print("🚀 Starting speech thread")
 
     with state_lock:
         stop_speaking = True

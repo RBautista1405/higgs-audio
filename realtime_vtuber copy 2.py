@@ -1,3 +1,4 @@
+import sounddevice as sd
 import numpy as np
 import scipy.io.wavfile as wav
 import tempfile
@@ -5,21 +6,22 @@ import subprocess
 import json
 import websocket
 import time
+import torch
 import os
 import threading
 import re
 import signal
 import sys
 
+from faster_whisper import WhisperModel
 from openai import OpenAI
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # ================= CONFIG =================
-VTS_WS = "ws://127.0.0.1:8001"
-
-# 👉 CHANGE THIS if needed
-MODEL_PATH = "model"  # e.g. "checkpoints/higgs.pt"
+SAMPLE_RATE = 16000
+CHUNK_DURATION = 1.5
+VTS_WS = "ws://localhost:8001"
 
 # ================= GLOBAL STATE =================
 state_lock = threading.Lock()
@@ -30,17 +32,52 @@ stop_speaking = False
 current_speech_thread = None
 ws = None
 
+# ================= CUDA =================
+if not torch.cuda.is_available():
+    raise RuntimeError("❌ CUDA not available")
+
+print("🚀 Loading Whisper...")
+whisper_model = WhisperModel("base", device="cuda", compute_type="float16")
+print("✅ Whisper ready")
+
 # ================= CLEAN EXIT =================
 def shutdown(sig=None, frame=None):
     print("\n🛑 Shutting down...")
     try:
-        import sounddevice as sd
         sd.stop()
     except:
         pass
     sys.exit(0)
 
 signal.signal(signal.SIGINT, shutdown)
+
+# ================= AUDIO =================
+def record_audio(duration=1.5):
+    audio = sd.rec(int(duration * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1, dtype='int16')
+    sd.wait()
+
+    # 🔥 silence detection (prevents random triggers)
+    if np.abs(audio).mean() < 100:
+        return None
+
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    wav.write(temp.name, SAMPLE_RATE, audio)
+    return temp.name
+
+# ================= STT =================
+def transcribe(path):
+    if not path:
+        return ""
+
+    segments, _ = whisper_model.transcribe(path)
+    text = " ".join([s.text for s in segments]).strip()
+    os.remove(path)
+
+    if len(text) < 3:
+        return ""
+
+    print("📝 You:", text)
+    return text
 
 # ================= LLM =================
 def ask_llm(text):
@@ -55,24 +92,20 @@ def ask_llm(text):
     print("🤖 AI:", reply)
     return reply
 
-# ================= HIGGS (FIXED) =================
+# ================= HIGGS =================
 def higgs_tts(text):
     out = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
 
-    print("🔊 Generating TTS (Higgs real)...")
-
     try:
         subprocess.run([
-            "python",
-            "examples/generation.py",
-            "--transcript", text,
-            "--out_path", out
-        ], check=True)
-    except Exception as e:
-        print("❌ Higgs failed:", e)
+            "python", "higgs_audio/infer.py",
+            "--text", text,
+            "--output", out
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    except:
+        print("⚠️ Higgs failed")
         return None
 
-    print(f"📁 TTS file: {out}")
     return out
 
 def split_sentences(text):
@@ -85,65 +118,69 @@ def ws_send(payload):
     try:
         with ws_lock:
             ws.send(json.dumps(payload))
-            ws.settimeout(2)
+            ws.settimeout(2)  # 🔥 prevent freeze
             return json.loads(ws.recv())
     except:
         print("⚠️ WS reconnecting...")
+        ws = connect_vts()
         return None
 
 def connect_vts():
     global ws
 
-    try:
-        print("🔌 Connecting to VTube Studio...")
-        ws = websocket.create_connection(VTS_WS, timeout=5)
+    while True:
+        try:
+            print("🔌 Connecting to VTube Studio...")
+            ws = websocket.create_connection(VTS_WS, timeout=5)
 
-        token_req = {
-            "apiName": "VTubeStudioPublicAPI",
-            "apiVersion": "1.0",
-            "requestID": str(time.time()),
-            "messageType": "AuthenticationTokenRequest",
-            "data": {
-                "pluginName": "AI VTuber",
-                "pluginDeveloper": "You"
+            # 🔥 Always triggers permission popup
+            token_req = {
+                "apiName": "VTubeStudioPublicAPI",
+                "apiVersion": "1.0",
+                "requestID": str(time.time()),
+                "messageType": "AuthenticationTokenRequest",
+                "data": {
+                    "pluginName": "AI VTuber",
+                    "pluginDeveloper": "You"
+                }
             }
-        }
 
-        ws.send(json.dumps(token_req))
-        res = json.loads(ws.recv())
+            ws.send(json.dumps(token_req))
+            res = json.loads(ws.recv())
 
-        if "data" not in res:
-            print("⚠️ No token received")
-            return None
+            if "data" not in res:
+                print("⚠️ Waiting for VTS permission popup...")
+                time.sleep(2)
+                continue
 
-        token = res["data"]["authenticationToken"]
-        print("🔑 Token received → CLICK ALLOW IN VTS")
+            token = res["data"]["authenticationToken"]
+            print("🔑 Token received → CLICK ALLOW IN VTS")
 
-        auth_req = {
-            "apiName": "VTubeStudioPublicAPI",
-            "apiVersion": "1.0",
-            "requestID": str(time.time()),
-            "messageType": "AuthenticationRequest",
-            "data": {
-                "pluginName": "AI VTuber",
-                "pluginDeveloper": "You",
-                "authenticationToken": token
+            auth_req = {
+                "apiName": "VTubeStudioPublicAPI",
+                "apiVersion": "1.0",
+                "requestID": str(time.time()),
+                "messageType": "AuthenticationRequest",
+                "data": {
+                    "pluginName": "AI VTuber",
+                    "pluginDeveloper": "You",
+                    "authenticationToken": token
+                }
             }
-        }
 
-        ws.send(json.dumps(auth_req))
-        auth_res = json.loads(ws.recv())
+            ws.send(json.dumps(auth_req))
+            auth_res = json.loads(ws.recv())
 
-        if auth_res.get("data", {}).get("authenticated"):
-            print("✅ Connected to VTube Studio")
-            return ws
+            if auth_res.get("data", {}).get("authenticated"):
+                print("✅ Connected to VTube Studio")
+                return ws
 
-        print("⚠️ Authentication failed")
-        return None
+            print("⚠️ Not authenticated yet...")
+            time.sleep(2)
 
-    except Exception as e:
-        print("❌ VTS connection failed:", e)
-        return None
+        except Exception as e:
+            print("❌ VTS connection failed:", e)
+            time.sleep(2)
 
 # ================= EXPRESSIONS =================
 def detect_emotion(text):
@@ -193,17 +230,12 @@ def play_audio(path):
     global is_speaking, stop_speaking
 
     if not path:
-        print("❌ No audio file")
         return
-
-    import sounddevice as sd
 
     rate, data = wav.read(path)
 
     if len(data.shape) > 1:
         data = data[:, 0]
-
-    print("🔊 Playing audio...")
 
     with state_lock:
         is_speaking = True
@@ -216,7 +248,7 @@ def play_audio(path):
 
         with state_lock:
             if stop_speaking:
-                sd.stop()
+                sd.stop()  # 🔥 instant cut
                 break
 
         send_mouth(data[i:i+chunk])
@@ -231,33 +263,25 @@ def play_audio(path):
 
 # ================= SPEECH =================
 def speak_stream(text):
-    print("🧠 Speaking:", text)
-
     sentences = split_sentences(text)
 
     for s in sentences:
+        with state_lock:
+            if stop_speaking:
+                break
+
         if not s.strip():
             continue
 
-        print("➡️ TTS sentence:", s)
-
         audio = higgs_tts(s)
-
-        if not audio:
-            print("❌ No audio generated")
-            continue
-
         play_audio(audio)
 
 def speak_async(text):
-    global current_speech_thread, stop_speaking
+    global current_speech_thread
 
-    print("🚀 Starting speech thread")
-
-    with state_lock:
-        stop_speaking = True
-
-    time.sleep(0.1)
+    # 🔥 prevent stacking threads
+    if current_speech_thread and current_speech_thread.is_alive():
+        return
 
     current_speech_thread = threading.Thread(
         target=speak_stream,
@@ -268,27 +292,27 @@ def speak_async(text):
 
 # ================= MAIN =================
 def main():
-    print("🚀 Starting VTuber (TEXT MODE)...")
+    global stop_speaking
 
-    ws_conn = connect_vts()
-
-    if ws_conn:
-        print("🟢 Ready for input!")
-    else:
-        print("⚠️ Running WITHOUT VTube Studio")
+    print("🚀 Starting VTuber...")
+    connect_vts()
 
     while True:
         try:
-            text = input("💬 You: ").strip()
+            audio = record_audio(CHUNK_DURATION)
+            text = transcribe(audio)
 
             if not text:
                 continue
 
+            # 🔥 instant interrupt
+            with state_lock:
+                stop_speaking = True
+
             reply = ask_llm(text)
 
-            if ws_conn:
-                emotion = detect_emotion(reply)
-                trigger_expression(emotion)
+            emotion = detect_emotion(reply)
+            trigger_expression(emotion)
 
             speak_async(reply)
 
