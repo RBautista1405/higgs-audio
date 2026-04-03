@@ -172,8 +172,15 @@ def trigger_expression(hotkey):
 
 # ================= MOUTH =================
 def send_mouth(chunk):
+    # Convert to float32 in range -1.0 to 1.0
+    if chunk.dtype.kind == 'i':
+        chunk = chunk.astype(np.float32) / np.iinfo(chunk.dtype).max
+    elif chunk.dtype.kind == 'f':
+        chunk = chunk.astype(np.float32)
+
     vol = np.abs(chunk).mean()
-    mouth = min(vol / 2000, 1.0)
+    # Scale volume to mouth open (tweak 0.2 multiplier for sensitivity)
+    mouth = min(vol * 3.0, 1.0)  
 
     msg = {
         "apiName": "VTubeStudioPublicAPI",
